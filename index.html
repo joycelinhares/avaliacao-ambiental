@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Avaliação automática - Trabalho 2</title>
+
+  <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/light/main.css" />
+  <script src="https://js.arcgis.com/4.29/"></script>
+
+  <style>
+    html, body, #viewDiv { height: 100%; width: 100%; margin: 0; padding: 0; }
+    .panel {
+      position: absolute; z-index: 10; top: 12px; left: 12px;
+      background: white; padding: 10px 12px; border-radius: 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,.15); width: 360px;
+      font-family: Arial, sans-serif; font-size: 13px;
+      max-height: calc(100vh - 24px);
+      overflow: auto;
+    }
+    .ok { color: #0a7; font-weight: 700; }
+    .no { color: #c33; font-weight: 700; }
+    .muted { color: #666; }
+    button { cursor: pointer; }
+    hr { border: none; border-top: 1px solid #eee; margin: 10px 0; }
+    .small { font-size: 12px; }
+  </style>
+</head>
+
+<body>
+  <div class="panel">
+    <div><b>Avaliação automática</b></div>
+    <div class="muted" style="margin-top:6px">
+      1) Desenhe a área no mapa (ferramenta no canto superior direito).<br/>
+      2) Clique em <b>Avaliar</b> para ligar/desligar automaticamente as camadas.
+    </div>
+
+    <div style="margin-top:8px; display:flex; gap:8px;">
+      <button id="btn">Avaliar</button>
+      <button id="btnClear" title="Limpar desenho">Limpar</button>
+    </div>
+
+    <div id="out" style="margin-top:10px"></div>
+    <div class="muted small" style="margin-top:8px">
+      *O app usa WFS (IDE-Sisema) para checar interseção. Se aparecer erro de CORS, me mande o print.
+    </div>
+  </div>
+
+  <div id="viewDiv"></div>
+
+<script>
+require([
+  "esri/WebMap",
+  "esri/views/MapView",
+  "esri/widgets/Sketch",
+  "esri/layers/GraphicsLayer",
+  "esri/geometry/support/webMercatorUtils"
+], function(WebMap, MapView, Sketch, GraphicsLayer, webMercatorUtils) {
+
+  // ====== CONFIG FIXA (já pronta) ======
+  const WEBMAP_ID = "5f392c9832394c86b1cfca35f215d47e";
+  const WFS_BASE  = "https://geoserver.meioambiente.mg.gov.br/ows"; // IDE-Sisema (WFS)
+
+  // ====== 1) Carrega o seu Web Map ======
+  const webmap = new WebMap({
+    portalItem: { id: WEBMAP_ID }
+  });
+
+  const view = new MapView({
+    container: "viewDiv",
+    map: webmap
+  });
+
+  // ====== 2) Camada para desenho do usuário ======
+  const drawLayer = new GraphicsLayer({ title: "Área do usuário" });
+  webmap.add(drawLayer);
+
+  // ====== 3) Widget de desenho ======
+  const sketch = new Sketch({
+    layer: drawLayer,
+    view,
+    creationMode: "single",
+    availableCreateTools: ["polygon", "rectangle"]
+  });
+  view.ui.add(sketch, "top-right");
+
+  document.getElementById("btnClear").onclick = () => {
+    drawLayer.removeAll();
+    document.getElementById("out").innerHTML = "<span class='muted'>Desenho limpo. Desenhe uma nova área e clique em Avaliar.</span>";
+  };
+
+  // ====== util: converte polígono para WKT (EPSG:4326) ======
+  function polygonToWKT4326(geom) {
+    let g = geom;
+    if (g.spatialReference && g.spatialReference.isWebMercator) {
+      g = webMercatorUtils.webMercatorToGeographic(g);
+    }
+    const ring = g.rings[0];
+    const coords = ring.map(pt => `${pt[0]} ${pt[1]}`);
+    if (coords[0] !== coords[coords.length - 1]) coords.push(coords[0]);
+    return `POLYGON((${coords.join(",")}))`;
+  }
+
+  // ====== WFS hits: retorna número de feições que intersectam ======
+  async function wfsHits(typeName, geomField, wkt) {
+    const url = new URL(WFS_BASE);
+    url.searchParams.set("service", "WFS");
+    url.searchParams.set("version", "2.0.0");
+    url.searchParams.set("request", "GetFeature");
+    url.searchParams.set("typeNames", typeName);
+    url.searchParams.set("resultType", "hits");
+    url.searchParams.set("outputFormat", "application/json");
+    url.searchParams.set("CQL_FILTER", `INTERSECTS(${geomField}, ${wkt})`);
+
+    const r = await fetch(url.toString());
+    if (!r.ok) throw new Error(`WFS ${r.status} em ${typeName}`);
+    const j = await r.json();
+    return (typeof j.numberMatched === "number") ? j.numberMatched : 0;
+  }
+
+  // ====== Coleta automaticamente as camadas do seu WebMap que vêm do GeoServer MG ======
+  function collectCandidates() {
+    const candidates = [];
+
+    // percorre camadas (inclui grupos)
+    const walk = (layer) => {
+      if (!layer) return;
+
+      // GroupLayer
+      if (layer.layers && typeof layer.layers.forEach === "function") {
+        layer.layers.forEach(walk);
+      }
+
+      // Tenta identificar camadas que usam o GeoServer MG
+      const url = (layer.url || "").toLowerCase();
+      const title = layer.title || "";
+
+      // Caso comum: WMSLayer (IDE) no WebMap
+      // No ArcGIS JS API, WMSLayer tem 'sublayers' (cada sublayer tem name/title)
+      if (layer.declaredClass && layer.declaredClass.includes("WMSLayer") &&
+          url.includes("geoserver.meioambiente.mg.gov.br")) {
+
+        const subs = layer.sublayers ? layer.sublayers.toArray() : [];
+        if (subs.length) {
+          subs.forEach(sub => {
+            const typeName = sub.name; // geralmente "workspace:layer"
+            const lbl = sub.title || title || typeName;
+            if (typeName) {
+              candidates.push({
+                label: lbl,
+                typeName: typeName,
+                geomField: "the_geom",
+                // para ligar/desligar visualmente, vamos alternar a visibilidade do WMS principal
+                // e manter o sublayer ligado (como ele já está no WMS).
+                layerObject: layer,
+                layerTitle: title || lbl
+              });
+            }
+          });
+        } else {
+          // sem sublayers detectáveis: ainda assim tenta usar o título como referência visual
+          candidates.push({
+            label: title,
+            typeName: null,
+            geomField: "the_geom",
+            layerObject: layer,
+            layerTitle: title
+          });
+        }
+      }
+    };
+
+    webmap.layers.forEach(walk);
+
+    // remove duplicados por (label + typeName)
+    const seen = new Set();
+    const uniq = [];
+    for (const c of candidates) {
+      const key = `${c.label}__${c.typeName || ""}`;
+      if (!seen.has(key)) { seen.add(key); uniq.push(c); }
+    }
+    return uniq;
+  }
+
+  // ====== tenta identificar camadas de limites pelo nome (se existirem no seu mapa) ======
+  function guessLimitType(candidates, keywords) {
+    const kw = keywords.map(k => k.toLowerCase());
+    for (const c of candidates) {
+      const s = `${c.label} ${c.layerTitle} ${c.typeName || ""}`.toLowerCase();
+      if (kw.some(k => s.includes(k))) return c;
+    }
+    return null;
+  }
+
+  // ====== executa promessas em lotes (para não travar) ======
+  async function runBatched(items, batchSize, fn) {
+    const results = [];
+    for (let i = 0; i < items.length; i += batchSize) {
+      const batch = items.slice(i, i + batchSize);
+      const res = await Promise.all(batch.map(fn));
+      results.push(...res);
+    }
+    return results;
+  }
+
+  // ====== Botão Avaliar ======
+  document.getElementById("btn").onclick = async () => {
+    const out = document.getElementById("out");
+    out.innerHTML = "Avaliando...";
+
+    const g = drawLayer.graphics.getItemAt(0);
+    if (!g) {
+      out.innerHTML = "<span class='no'>Desenhe uma área primeiro.</span>";
+      return;
+    }
+
+    const wkt = polygonToWKT4326(g.geometry);
+
+    // Puxa automaticamente as camadas do seu WebMap que são do GeoServer MG
+    const candidatesAll = collectCandidates();
+
+    // Se o seu WebMap tiver muita coisa, isso pode vir grande.
+    // A lógica abaixo:
+    // - tenta rodar WFS hits para quem tem typeName
+    // - se não tiver typeName, só não avalia (mas mantém como está)
+    const candidates = candidatesAll.filter(c => !!c.typeName);
+
+    // Limites: tenta detectar automaticamente (se existirem no seu mapa)
+    const munLayer = guessLimitType(candidates, ["munic", "municí", "municip"]);
+    const ufLayer  = guessLimitType(candidates, ["estado", "uf", "limite estadual", "unidade federativa"]);
+
+    // Avalia restrições (hits) em lotes
+    const batchSize = 6;
+
+    const results = await runBatched(candidates, batchSize, async (c) => {
+      try {
+        const hits = await wfsHits(c.typeName, c.geomField, wkt);
+        const ok = hits > 0;
+
+        // Ativa/desativa automaticamente a camada visual correspondente
+        // Aqui optamos por ligar/desligar o WMS principal (layerObject)
+        // Se o WMS agrupa várias subcamadas, isso liga/desliga o conjunto.
+        if (c.layerObject) c.layerObject.visible = ok;
+
+        return { ...c, hits, ok, error: null };
+      } catch (e) {
+        console.error(e);
+        // Em caso de erro, não mexe na visibilidade (para não “sumir” tudo)
+        return { ...c, hits: 0, ok: false, error: String(e.message || e) };
+      }
+    });
+
+    // Monta a saída
+    let html = "";
+
+    // Competência (heurística básica)
+    // Aqui só mostramos "detectado", porque para contar municípios/UF de verdade
+    // seria ideal rodar GetFeature e coletar atributos. (Dá para evoluir depois.)
+    if (munLayer || ufLayer) {
+      html += "<b>Limites (detecção no mapa)</b><br/>";
+      html += `Municípios no mapa: ${munLayer ? "<span class='ok'>SIM</span>" : "<span class='no'>NÃO</span>"}<br/>`;
+      html += `Estados/UF no mapa: ${ufLayer ? "<span class='ok'>SIM</span>" : "<span class='no'>NÃO</span>"}<br/>`;
+      html += "<hr/>";
+    }
+
+    html += "<b>Restrições / camadas ativadas automaticamente</b><br/>";
+
+    // Ordena: primeiro as que deram SIM
+    results.sort((a,b) => (b.ok - a.ok) || (a.label.localeCompare(b.label)));
+
+    for (const r of results) {
+      const status = r.error
+        ? `<span class="no">erro</span> <span class="muted small">(${r.error})</span>`
+        : (r.ok ? `<span class="ok">SIM</span>` : `<span class="no">NÃO</span>`);
+
+      html += `${r.label}: ${status} <span class="muted small">(feições: ${r.hits})</span><br/>`;
+    }
+
+    out.innerHTML = html;
+  };
+
+  // Mensagem inicial
+  view.when(() => {
+    document.getElementById("out").innerHTML =
+      "<span class='muted'>Mapa carregado. Desenhe a ADA e clique em <b>Avaliar</b>.</span>";
+  });
+
+});
+</script>
+</body>
+</html>
